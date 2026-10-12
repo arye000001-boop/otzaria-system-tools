@@ -173,9 +173,14 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 
 $AE = [Windows.Automation.AutomationElement]
-$RX_TEXT_ACTIONS = 'פעולות\s*(ה)?טקסט|Text\s*actions'
-$RX_COPY_ALL     = 'העתק(ת)?\s*(את\s*)?(כל\s*)?(ה)?טקסט|העתק\s*הכל|Copy\s*all\s*text'
-$RX_DONT_SAVE    = "^(אל\s*תשמור|לא\s*לשמור|Don.?t\s*save)$"
+# ביטויים עם \uXXXX כדי שיעבדו גם אם הקובץ נשמר בלי BOM.
+# "סרוק טקסט" (Scan text) / "פעולות טקסט" (Text actions)
+$ID_OCR          = 'OcrOverlayButton'
+$RX_OCR_BUTTON   = '\u05E1\u05E8\u05D5\u05E7\s*\u05D8\u05E7\u05E1\u05D8|\u05E4\u05E2\u05D5\u05DC\u05D5\u05EA\s*(\u05D4)?\u05D8\u05E7\u05E1\u05D8|Scan\s*text|Text\s*actions'
+# "העתק את כל הטקסט" / "העתק הכל" / Copy all text
+$RX_COPY_ALL     = '\u05D4\u05E2\u05EA\u05E7.*\u05D8\u05E7\u05E1\u05D8|\u05D4\u05E2\u05EA\u05E7\s*\u05D4\u05DB\u05DC|Copy\s*all'
+# "אל תשמור" / "לא לשמור" / Don't save
+$RX_DONT_SAVE    = '^(\u05D0\u05DC\s*\u05EA\u05E9\u05DE\u05D5\u05E8|\u05DC\u05D0\s*\u05DC\u05E9\u05DE\u05D5\u05E8|Don.?t\s*save)$'
 
 function Write-Result($obj) {
   $json = $obj | ConvertTo-Json -Compress -Depth 5
@@ -210,6 +215,43 @@ function Find-ByName($win, $regex) {
     if ($n -and $n -match $regex) { return $e }
   }
   return $null
+}
+function Find-ById($win, $id) {
+  $c = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::AutomationIdProperty, $id)
+  return $win.FindFirst([Windows.Automation.TreeScope]::Descendants, $c)
+}
+function Set-On($e) {
+  $pat = $null
+  if ($e.TryGetCurrentPattern([Windows.Automation.TogglePattern]::Pattern, [ref]$pat)) {
+    if ($pat.Current.ToggleState -ne [Windows.Automation.ToggleState]::On) { $pat.Toggle() }
+    return $true
+  }
+  return (Press $e)
+}
+function Wait-OcrButton($sec) {
+  $end = (Get-Date).AddSeconds($sec)
+  while ((Get-Date) -lt $end) {
+    $w = Get-SnipWindow
+    if ($w) {
+      $e = Find-ById $w $ID_OCR
+      if (-not $e) { $e = Find-ByName $w $RX_OCR_BUTTON }
+      if ($e) { return $e }
+    }
+    Start-Sleep -Milliseconds 300
+  }
+  return $null
+}
+function Get-ButtonNames {
+  $w = Get-SnipWindow
+  if (-not $w) { return '' }
+  $names = @()
+  foreach ($e in $w.FindAll([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.Condition]::TrueCondition)) {
+    $c = $e.Current
+    if ($c.Name -and $c.Name.Trim().Length -gt 0 -and $c.ControlType.ProgrammaticName -match 'Button|Custom|MenuItem') { $names += ('{0}[{1}]' -f $c.Name.Trim(), $c.AutomationId) }
+  }
+  $t = ($names | Select-Object -Unique) -join '; '
+  if ($t.Length -gt 900) { $t = $t.Substring(0, 900) }
+  return $t
 }
 function Wait-ByName($regex, $sec) {
   $end = (Get-Date).AddSeconds($sec)
@@ -269,20 +311,29 @@ try {
   $sentinel = '__snip_' + [guid]::NewGuid().ToString('N')
   [Windows.Forms.Clipboard]::SetText($sentinel)
 
-  # אם "העתק את כל הטקסט" כבר מוצג - ממשיכים; אחרת לוחצים "פעולות טקסט"
+  # מפעילים "סרוק טקסט" (הכפתור OcrOverlayButton) ואז "העתק את כל הטקסט"
   $copy = $null
   $w0 = Get-SnipWindow
   if ($w0) { $copy = Find-ByName $w0 $RX_COPY_ALL }
   if (-not $copy) {
-    $ta = Wait-ByName $RX_TEXT_ACTIONS ([Math]::Max(6, $TimeoutSec / 2))
-    if (-not $ta) { Close-Snip; Fail 'לא נמצא הכפתור "פעולות טקסט" בכלי החיתוך (הריצו עם -Dump ושלחו את הפלט)' }
-    if (-not (Press $ta)) { Close-Snip; Fail 'לא ניתן ללחוץ על "פעולות טקסט"' }
-    $copy = Wait-ByName $RX_COPY_ALL 10
+    $ta = Wait-OcrButton ([Math]::Max(6, $TimeoutSec / 2))
+    if (-not $ta) { $n = Get-ButtonNames; Close-Snip; Fail ('לא נמצא הכפתור "סרוק טקסט" בכלי החיתוך. כפתורים: ' + $n) }
+    if (-not (Set-On $ta)) { Close-Snip; Fail 'לא ניתן להפעיל את "סרוק טקסט"' }
+    $copy = Wait-ByName $RX_COPY_ALL 8
   }
-  if (-not $copy) { Close-Snip; Fail 'לא נמצא הכפתור "העתק את כל הטקסט" (ייתכן שלא זוהה טקסט בתמונה)' }
-  if (-not (Press $copy)) { Close-Snip; Fail 'לא ניתן ללחוץ על "העתק את כל הטקסט"' }
+  if ($copy) {
+    if (-not (Press $copy)) { Close-Snip; Fail 'לא ניתן ללחוץ על "העתק את כל הטקסט"' }
+  } else {
+    # גיבוי: בחירת כל הטקסט בשכבת הזיהוי והעתקה במקלדת
+    try { (Get-SnipWindow).SetFocus() } catch { }
+    Start-Sleep -Milliseconds 700
+    [Windows.Forms.SendKeys]::SendWait('^a')
+    Start-Sleep -Milliseconds 300
+    [Windows.Forms.SendKeys]::SendWait('^c')
+  }
 
   $text = $null
+  $names = Get-ButtonNames
   $end = (Get-Date).AddSeconds(6)
   while ((Get-Date) -lt $end) {
     Start-Sleep -Milliseconds 250
@@ -290,7 +341,7 @@ try {
     if ($t -and $t -ne $sentinel) { $text = $t; break }
   }
   Close-Snip
-  if ($null -eq $text) { Fail 'הלוח לא התעדכן - כנראה לא זוהה טקסט' }
+  if ($null -eq $text) { Fail ('הלוח לא התעדכן (לא נמצא "העתק את כל הטקסט" או שלא זוהה טקסט). כפתורים שנראו: ' + $names) }
   Write-Result @{ ok = $true; text = $text }
 }
 catch {
