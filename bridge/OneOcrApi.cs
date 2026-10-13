@@ -255,7 +255,7 @@ public static class OneOcrApi
         {
             var padded = new byte[pw * ph * 4];
             Array.Fill(padded, (byte)255);
-            for (int y = 0; y < h; y++) Buffer.BlockCopy(px, y * w * 4, padded, y * pw * 4, w * 4);
+            for (int y = 0; y < h; y++) System.Buffer.BlockCopy(px, y * w * 4, padded, y * pw * 4, w * 4);
             px = padded;
         }
 
