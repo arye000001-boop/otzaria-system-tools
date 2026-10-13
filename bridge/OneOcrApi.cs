@@ -59,6 +59,26 @@ public static class OneOcrApi
     private static D_Ptr GetLineContent, GetLineBox, GetWordContent, GetWordBox;
     private static D_Release ReleaseResult, ReleaseInit, ReleasePipeline, ReleaseOpts;
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PowerThrottling { public uint Version, ControlMask, StateMask; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetProcessInformation(IntPtr hProcess, int infoClass, ref PowerThrottling info, int size);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+
+    private static bool _boosted, _boostOk;
+    /// <summary>הגשר הוא אפליקציית מגש בלי חלון, ו-Windows 11 עלול להכניס אותה ל"מצב יעילות" (EcoQoS) ולהאט חישוב כבד פי כמה — מכבים את זה לתהליך.</summary>
+    private static void Boost()
+    {
+        if (_boosted) return;
+        _boosted = true;
+        try
+        {
+            var s = new PowerThrottling { Version = 1, ControlMask = 1, StateMask = 0 }; // EXECUTION_SPEED: ביצועים מלאים
+            _boostOk = SetProcessInformation(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, ref s, Marshal.SizeOf<PowerThrottling>());
+        }
+        catch { }
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern uint GetShortPathNameW(string longPath, StringBuilder shortPath, uint len);
 
@@ -258,6 +278,7 @@ public static class OneOcrApi
 
     private static object RunNative(byte[] px, int w, int h, long decodeMs)
     {
+        Boost();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         EnsureEngine();
         long loadMs = sw.ElapsedMilliseconds;
@@ -279,10 +300,16 @@ public static class OneOcrApi
             sw.Restart();
             Check(RunPipeline(_pipeline, ref img, _opts, out long res), "RunOcrPipeline");
             long runMs = sw.ElapsedMilliseconds;
-            try { return Parse(res, w, h, new { decode = decodeMs, load = loadMs, ocr = runMs }); }
+            try { return Parse(res, w, h, new { decode = decodeMs, load = loadMs, ocr = runMs, ort = OrtMb(), boost = _boostOk }); }
             finally { ReleaseResult(res); }
         }
         finally { pin.Free(); }
+    }
+
+    private static double OrtMb()
+    {
+        try { return Math.Round(new FileInfo(Path.Combine(DataDir, "onnxruntime.dll")).Length / 1048576.0, 1); }
+        catch { return 0; }
     }
 
     private static string Utf8(IntPtr p) => p == IntPtr.Zero ? "" : (Marshal.PtrToStringUTF8(p) ?? "");
