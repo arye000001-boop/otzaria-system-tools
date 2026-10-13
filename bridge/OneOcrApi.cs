@@ -25,7 +25,7 @@ public static class OneOcrApi
     private static readonly SemaphoreSlim Gate = new(1, 1);
     private static IntPtr _lib;
     private static long _init, _pipeline, _opts;
-    private static Timer _idle;
+    private static System.Threading.Timer _idle;
 
     public static void Register()
     {
@@ -192,7 +192,7 @@ public static class OneOcrApi
     private static void ArmIdle()
     {
         _idle?.Dispose();
-        _idle = new Timer(_ => Unload(), null, IdleUnload, Timeout.InfiniteTimeSpan);
+        _idle = new System.Threading.Timer(_ => Unload(), null, IdleUnload, Timeout.InfiniteTimeSpan);
     }
 
     // ── נקודות קצה ─────────────────────────────────────────────────────
