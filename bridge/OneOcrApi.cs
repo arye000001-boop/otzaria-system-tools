@@ -20,7 +20,7 @@ public static class OneOcrApi
     private static readonly string[] Files = { "onnxruntime.dll", "oneocr.dll", "oneocr.onemodel" };
     private const string ModelKey = "kj)TGtrK>f]b[Piow.gU+nC@s\"\"\"\"\"\"4";
     private const int MinSide = 50, MaxSide = 10000, MaxLines = 1000;
-    private static readonly TimeSpan IdleUnload = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan IdleUnload = TimeSpan.FromMinutes(30);
 
     private static readonly SemaphoreSlim Gate = new(1, 1);
     private static IntPtr _lib;
@@ -189,6 +189,14 @@ public static class OneOcrApi
         finally { Gate.Release(); }
     }
 
+    private static async Task Warm()
+    {
+        if (!await Gate.WaitAsync(0)) return;
+        try { EnsureEngine(); } catch { }
+        finally { Gate.Release(); }
+        ArmIdle();
+    }
+
     private static void ArmIdle()
     {
         _idle?.Dispose();
@@ -200,6 +208,7 @@ public static class OneOcrApi
     {
         string err = null; bool ok = false;
         try { Prepare(); ok = true; } catch (Exception ex) { err = ex.Message; }
+        if (ok && _pipeline == 0) _ = Task.Run(Warm); // טוען את המנוע ברקע, כדי שהעמוד הראשון לא ימתין לטעינה
         return new { available = ok, loaded = _pipeline != 0, dataDir = DataDir, error = err, engine = "oneocr" };
     }
 
@@ -216,6 +225,7 @@ public static class OneOcrApi
     /// קואורדינטות בפיקסלים של התמונה; box = ארבע פינות (ימין-שמאל/עליון-תחתון לפי הסיבוב), x/y/w/h = מלבן חוסם.</summary>
     private static async Task<object> Recognize(JsonElement b)
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         byte[] bytes = DecodeImage(b.Req("image"));
         if (bytes.Length == 0) throw BridgeException.BadRequest("התמונה ריקה");
 
@@ -239,15 +249,18 @@ public static class OneOcrApi
         var pd = await decoder.GetPixelDataAsync(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Straight,
             new BitmapTransform(), ExifOrientationMode.IgnoreExifOrientation, ColorManagementMode.DoNotColorManage);
         byte[] px = pd.DetachPixelData();
+        long decodeMs = sw.ElapsedMilliseconds;
 
         await Gate.WaitAsync();
-        try { return await Task.Run(() => RunNative(px, w, h)); }
+        try { return await Task.Run(() => RunNative(px, w, h, decodeMs)); }
         finally { Gate.Release(); ArmIdle(); }
     }
 
-    private static object RunNative(byte[] px, int w, int h)
+    private static object RunNative(byte[] px, int w, int h, long decodeMs)
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         EnsureEngine();
+        long loadMs = sw.ElapsedMilliseconds;
 
         // המנוע דורש לפחות 50 פיקסלים בכל צד: מרפדים בלבן (הקואורדינטות נשארות כמו במקור)
         int pw = Math.Max(w, MinSide), ph = Math.Max(h, MinSide);
@@ -263,8 +276,10 @@ public static class OneOcrApi
         try
         {
             var img = new ImageStruct { Type = 3, Width = pw, Height = ph, Step = (long)pw * 4, Data = pin.AddrOfPinnedObject() };
+            sw.Restart();
             Check(RunPipeline(_pipeline, ref img, _opts, out long res), "RunOcrPipeline");
-            try { return Parse(res, w, h); }
+            long runMs = sw.ElapsedMilliseconds;
+            try { return Parse(res, w, h, new { decode = decodeMs, load = loadMs, ocr = runMs }); }
             finally { ReleaseResult(res); }
         }
         finally { pin.Free(); }
@@ -292,7 +307,7 @@ public static class OneOcrApi
         return null;
     }
 
-    private static object Parse(long res, int width, int height)
+    private static object Parse(long res, int width, int height, object ms)
     {
         Check(GetLineCount(res, out long n), "GetOcrLineCount");
         var lines = new List<object>();
@@ -321,6 +336,6 @@ public static class OneOcrApi
             lines.Add(new { text, box = lbox, x = lx, y = ly, w = lw, h = lh, words });
         }
         float? angle = GetAngle(res, out float a) == 0 ? a : null;
-        return new { text = all.ToString(), angle, width, height, engine = "oneocr", lines };
+        return new { text = all.ToString(), angle, width, height, engine = "oneocr", ms, lines };
     }
 }
