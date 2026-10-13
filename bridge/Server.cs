@@ -52,6 +52,7 @@ public static class Server
         RecycleApi.Register();
         OcrApi.Register();
         SnipApi.Register();
+        OneOcrApi.Register();
         UpdateApi.Register();
         SysApi.Register();
         DeviceApi.Register();
