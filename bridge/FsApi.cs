@@ -45,6 +45,7 @@ public static class FsApi
         Server.Route("/fs/delete", Delete);
         Server.Route("/fs/read", Read);
         Server.Route("/fs/write-text", WriteText);
+        Server.Route("/fs/write-binary", WriteBinary);
         Server.Route("/fs/open", Open);
         Server.Route("/fs/reveal", Reveal);
         Server.Route("/fs/clipboard-get", _ => ClipboardGet());
@@ -457,6 +458,43 @@ public static class FsApi
         }
     }
 
+    /// <summary>כתיבת קובץ בינארי בחתיכות. גוף: { path, content (base64), append?, overwrite?, unique? }.
+    /// unique = אם הקובץ קיים — "שם (2).סיומת" (לא דורס). החתיכה הראשונה מחזירה את הנתיב הסופי; הבאות מצרפות אליו עם append.</summary>
+    private static object WriteBinary(JsonElement b)
+    {
+        string path = FullPath(b.Req("path"));
+        Kiosk.EnsureFileWriteAllowed();
+        EnsureNotProtected(path);
+        bool append = b.Bool("append"), overwrite = b.Bool("overwrite"), unique = b.Bool("unique");
+        if (Directory.Exists(path)) throw BridgeException.Exists("קיימת תיקייה בשם זה");
+        string dir = Path.GetDirectoryName(path);
+        if (!Directory.Exists(dir)) throw BridgeException.NotFound("התיקייה לא נמצאה: " + dir);
+        byte[] data;
+        try { data = Convert.FromBase64String(b.Str("content", "")); }
+        catch (FormatException) { throw BridgeException.BadRequest("התוכן אינו base64 תקין"); }
+
+        if (!append)
+        {
+            if (File.Exists(path))
+            {
+                if (unique)
+                {
+                    string stem = Path.GetFileNameWithoutExtension(path), ext = Path.GetExtension(path);
+                    int n = 2;
+                    do { path = Path.Combine(dir, stem + " (" + n + ")" + ext); n++; } while (File.Exists(path));
+                }
+                else if (!overwrite) throw BridgeException.Exists("הקובץ כבר קיים: " + path);
+            }
+            File.WriteAllBytes(path, data);
+        }
+        else
+        {
+            if (!File.Exists(path)) throw BridgeException.NotFound("הקובץ לא נמצא להמשך כתיבה: " + path);
+            using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+            fs.Write(data, 0, data.Length);
+        }
+        return new { path, size = new FileInfo(path).Length };
+    }
     private static object WriteText(JsonElement b)
     {
         string path = FullPath(b.Req("path"));
