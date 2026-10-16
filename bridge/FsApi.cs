@@ -34,6 +34,7 @@ public static class FsApi
 
     public static void Register()
     {
+        FxPolicy.Register();
         Server.Route("/fs/roots", _ => Roots());
         Server.Route("/fs/list", List);
         Server.Route("/fs/stat", b => Stat(FullPath(b.Req("path"))));
@@ -60,7 +61,9 @@ public static class FsApi
         if (string.IsNullOrWhiteSpace(p)) throw BridgeException.BadRequest("נתיב ריק");
         p = Environment.ExpandEnvironmentVariables(p.Trim());
         if (!Path.IsPathFullyQualified(p)) throw BridgeException.BadRequest("נדרש נתיב מלא: " + p);
-        return Path.GetFullPath(p);
+        string full = Path.GetFullPath(p);
+        FxPolicy.EnsurePathAllowed(full);   // מדיניות סייר הקבצים: נעילה או הגבלה לתיקיות
+        return full;
     }
 
     private static string Iso(DateTime t) => t.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
@@ -72,6 +75,20 @@ public static class FsApi
 
     /// <summary>אזורים מוגנים: מחיקה, העברה ושינוי שם אסורים</summary>
     internal static void EnsureNotProtected(string p)
+    {
+        // ביקורת #30 ממצא 3: השוואת מחרוזות לבדה עקיפה דרך \\?\, שמות 8.3 וצמתים.
+        // בודקים גם את הנתיב כפי שנכתב וגם את הנתיב הסופי שמערכת הקבצים מחזירה.
+        if (p.StartsWith(@"\\?\") || p.StartsWith(@"\\.\") || p.StartsWith(@"\??\"))
+            throw BridgeException.Forbidden("נתיב מסוג התקן אינו נתמך");
+        EnsureNotProtectedCore(p);
+        string canon = CanonicalPath(p);
+        if (!string.Equals(canon, Path.GetFullPath(p), StringComparison.OrdinalIgnoreCase)) EnsureNotProtectedCore(canon);
+    }
+
+    /// <summary>הנתיב הסופי (שמות ארוכים, צמתים וקישורים מפוענחים) של הנתיב או של ההורה הקיים הקרוב. הלוגיקה ב-PathPolicy</summary>
+    internal static string CanonicalPath(string p) => PathPolicy.Canonical(p, strict: false);
+
+    private static void EnsureNotProtectedCore(string p)
     {
         string full = Path.GetFullPath(p).TrimEnd('\\');
         string root = Path.GetPathRoot(full)?.TrimEnd('\\') ?? "";
@@ -121,6 +138,7 @@ public static class FsApi
 
     private static object Roots()
     {
+        FxPolicy.EnsureAvailable();
         var drives = new List<object>();
         foreach (var d in DriveInfo.GetDrives())
         {
@@ -139,11 +157,27 @@ public static class FsApi
             drives.Add(new { path = d.RootDirectory.FullName, label, type, totalBytes = total, freeBytes = free });
         }
 
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var known = new List<object>();
+        foreach (var k in KnownFolders()) known.Add(new { k.id, k.name, k.path });
+        if (FxPolicy.IsRestricted)
+        {
+            // מצב מוגבל: רק התיקיות שהמנהל התיר. כוננים ותיקיות אחרות לא מוצגים
+            drives.Clear();
+            known.Clear();
+            foreach (string r in FxPolicy.ActiveRoots())
+                known.Add(new { id = "root", name = Path.GetFileName(r.TrimEnd('\\')) is { Length: > 0 } n ? n : r, path = r });
+        }
+        return new { drives, known };
+    }
+
+    /// <summary>תיקיות המערכת המוכרות שקיימות במחשב (שולחן עבודה, מסמכים...)</summary>
+    internal static List<(string id, string name, string path)> KnownFolders()
+    {
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var known = new List<(string, string, string)>();
         void Add(string id, string name, string path)
         {
-            if (!string.IsNullOrEmpty(path) && Directory.Exists(path)) known.Add(new { id, name, path });
+            if (!string.IsNullOrEmpty(path) && Directory.Exists(path)) known.Add((id, name, path));
         }
         Add("desktop", "שולחן העבודה", Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
         Add("documents", "מסמכים", Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
@@ -152,7 +186,7 @@ public static class FsApi
         Add("music", "מוזיקה", Environment.GetFolderPath(Environment.SpecialFolder.MyMusic));
         Add("videos", "סרטונים", Environment.GetFolderPath(Environment.SpecialFolder.MyVideos));
         Add("home", "תיקיית הבית", home);
-        return new { drives, known };
+        return known;
     }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
@@ -192,7 +226,9 @@ public static class FsApi
             else if (i is FileInfo f)
                 files.Add(new { name = f.Name, path = f.FullName, type = "file", size = f.Length, modified = Iso(f.LastWriteTime), ext = f.Extension.TrimStart('.').ToLowerInvariant(), hidden });
         }
-        return new { path = dir.FullName, parent = dir.Parent?.FullName, entries = dirs.Concat(files) };
+        string parent = dir.Parent?.FullName;
+        if (parent != null && !FxPolicy.IsPathAllowed(parent)) parent = null;   // לא חושפים נתיב מחוץ לתיקיות המותרות
+        return new { path = dir.FullName, parent, entries = dirs.Concat(files) };
     }
 
     private static object Stat(string path)
@@ -249,6 +285,7 @@ public static class FsApi
         EnsureNotProtected(path);
 
         string dest = Path.Combine(Path.GetDirectoryName(path)!, newName);
+        FxPolicy.EnsurePathAllowed(dest);
         bool caseOnly = string.Equals(dest, path, StringComparison.OrdinalIgnoreCase);
         if (!caseOnly && Exists(dest)) throw BridgeException.Exists("כבר קיים: " + dest);
 
@@ -287,6 +324,7 @@ public static class FsApi
                 if (move) EnsureNotProtected(src);
 
                 string dest = Path.Combine(destDir, Path.GetFileName(src.TrimEnd('\\')));
+                FxPolicy.EnsurePathAllowed(dest);   // היעד עצמו (למשל קישור/צומת בתוך התיקייה) חייב להישאר בתוך המדיניות
                 if (Directory.Exists(src) &&
                     (destDir + "\\").StartsWith(src.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))
                     throw BridgeException.BadRequest("לא ניתן להעתיק תיקייה לתוך עצמה");
@@ -309,6 +347,7 @@ public static class FsApi
                     }
                 }
 
+                FxPolicy.EnsurePathAllowed(dest);
                 if (Directory.Exists(src))
                 {
                     bool sameVolume = string.Equals(Path.GetPathRoot(src), Path.GetPathRoot(dest), StringComparison.OrdinalIgnoreCase);
@@ -326,6 +365,7 @@ public static class FsApi
                 }
                 done++;
             }
+            catch (BridgeException bx) when (bx.Code.StartsWith("fx_")) { throw; }   // הפרת מדיניות מבטלת את כל הבקשה
             catch (Exception ex)
             {
                 failed.Add(new { path = src, message = ex.Message });
@@ -334,45 +374,88 @@ public static class FsApi
         return move ? new { moved = done, skipped, failed } : new { copied = done, skipped, failed };
     }
 
-    private static void CopyDir(string src, string dest, bool overwrite)
+    private static void CopyDir(string src, string dest, bool overwrite, int depth = 0)
     {
+        // תקרת עומק כהגנה אחרונה מפני רקורסיה פתולוגית
+        if (depth > 64) throw new IOException("עומק התיקיות עמוק מדי להעתקה: " + src);
         Directory.CreateDirectory(dest);
         foreach (string f in Directory.GetFiles(src))
             File.Copy(f, Path.Combine(dest, Path.GetFileName(f)), overwrite);
         foreach (string d in Directory.GetDirectories(src))
-            CopyDir(d, Path.Combine(dest, Path.GetFileName(d)), overwrite);
+        {
+            // דילוג על נקודות reparse (junction/symlink). junction שמצביע על תיקיית־אב יוצר לולאה
+            // אינסופית → StackOverflowException שאי אפשר ללכוד והורג את כל התהליך (הגשר והמגש).
+            if ((File.GetAttributes(d) & FileAttributes.ReparsePoint) != 0) continue;
+            CopyDir(d, Path.Combine(dest, Path.GetFileName(d)), overwrite, depth + 1);
+        }
     }
 
-    // מחיקה לסל המיחזור דרך SHFileOperation
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct SHFILEOPSTRUCT
+    // מחיקה לסל המיחזור דרך IFileOperation (ולא SHFileOperation הישן: הוא לא תומך בנתיבים
+    // ארוכים מ-MAX_PATH ונכשל עם קוד 124/DE_INVALIDFILES על תיקיות עמוקות בשמות עבריים/ארוכים)
+    [ComImport, Guid("3AD05575-8857-4850-9277-11B85BDB8E09")] private class FileOperationCoClass { }
+
+    [ComImport, Guid("947aab5f-0a5c-4c13-b4d6-4bf7836fc9f8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFileOperation
     {
-        public IntPtr hwnd;
-        public uint wFunc;
-        public string pFrom;
-        public string pTo;
-        public ushort fFlags;
-        public bool fAnyOperationsAborted;
-        public IntPtr hNameMappings;
-        public string lpszProgressTitle;
+        void Advise(IntPtr pfops, out uint pdwCookie);
+        void Unadvise(uint dwCookie);
+        void SetOperationFlags(uint dwOperationFlags);
+        void SetProgressMessage([MarshalAs(UnmanagedType.LPWStr)] string pszMessage);
+        void SetProgressDialog(IntPtr popd);
+        void SetProperties(IntPtr pproparray);
+        void SetOwnerWindow(IntPtr hwndOwner);
+        void ApplyPropertiesToItem(IShellItem psiItem);
+        void ApplyPropertiesToItems(IntPtr punkItems);
+        void RenameItem(IShellItem psiItem, [MarshalAs(UnmanagedType.LPWStr)] string pszNewName, IntPtr pfopsItem);
+        void RenameItems(IntPtr pUnkItems, [MarshalAs(UnmanagedType.LPWStr)] string pszNewName);
+        void MoveItem(IShellItem psiItem, IShellItem psiDestinationFolder, [MarshalAs(UnmanagedType.LPWStr)] string pszNewName, IntPtr pfopsItem);
+        void MoveItems(IntPtr punkItems, IShellItem psiDestinationFolder);
+        void CopyItem(IShellItem psiItem, IShellItem psiDestinationFolder, [MarshalAs(UnmanagedType.LPWStr)] string pszCopyName, IntPtr pfopsItem);
+        void CopyItems(IntPtr punkItems, IShellItem psiDestinationFolder);
+        void DeleteItem(IShellItem psiItem, IntPtr pfopsItem);
+        void DeleteItems(IntPtr punkItems);
+        void NewItem(IShellItem psiDestinationFolder, uint dwFileAttributes, [MarshalAs(UnmanagedType.LPWStr)] string pszName, [MarshalAs(UnmanagedType.LPWStr)] string pszTemplateName, IntPtr pfopsItem);
+        void PerformOperations();
+        [return: MarshalAs(UnmanagedType.Bool)] bool GetAnyOperationsAborted();
     }
 
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-    private static extern int SHFileOperation(ref SHFILEOPSTRUCT op);
+    [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellItem
+    {
+        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+        void GetParent(out IShellItem ppsi);
+        void GetDisplayName(uint sigdnName, out IntPtr ppszName);
+        void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        void Compare(IShellItem psi, uint hint, out int piOrder);
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    private static extern void SHCreateItemFromParsingName([MarshalAs(UnmanagedType.LPWStr)] string path, IntPtr pbc, ref Guid riid, out IShellItem item);
 
     private static void Recycle(string path)
     {
-        const uint FO_DELETE = 3;
-        const ushort FOF_SILENT = 0x4, FOF_NOCONFIRMATION = 0x10, FOF_ALLOWUNDO = 0x40, FOF_NOERRORUI = 0x400;
-        var op = new SHFILEOPSTRUCT
+        const uint FOF_SILENT = 0x4, FOF_NOCONFIRMATION = 0x10, FOF_ALLOWUNDO = 0x40, FOF_NOERRORUI = 0x400;
+        var fo = (IFileOperation)new FileOperationCoClass();
+        IShellItem item = null;
+        try
         {
-            wFunc = FO_DELETE,
-            pFrom = path + "\0\0",
-            fFlags = FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI,
-        };
-        int r = SHFileOperation(ref op);
-        if (r != 0 || op.fAnyOperationsAborted)
-            throw new IOException("המחיקה לסל המיחזור נכשלה (קוד " + r + ")");
+            fo.SetOperationFlags(FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI);
+            Guid iid = typeof(IShellItem).GUID;
+            SHCreateItemFromParsingName(path, IntPtr.Zero, ref iid, out item);
+            fo.DeleteItem(item, IntPtr.Zero);
+            fo.PerformOperations();
+            if (fo.GetAnyOperationsAborted())
+                throw new IOException("המחיקה לסל המיחזור בוטלה");
+        }
+        catch (COMException ex)
+        {
+            throw new IOException("המחיקה לסל המיחזור נכשלה (קוד 0x" + ex.HResult.ToString("X8") + ")", ex);
+        }
+        finally
+        {
+            if (item != null) Marshal.ReleaseComObject(item);
+            Marshal.ReleaseComObject(fo);
+        }
     }
 
     private static object Delete(JsonElement b)
@@ -398,6 +481,7 @@ public static class FsApi
                 }
                 deleted++;
             }
+            catch (BridgeException bx) when (bx.Code.StartsWith("fx_")) { throw; }
             catch (Exception ex)
             {
                 failed.Add(new { path = p, message = ex.Message });
@@ -411,14 +495,19 @@ public static class FsApi
         string path = FullPath(b.Req("path"));
         if (!File.Exists(path)) throw BridgeException.NotFound("הקובץ לא נמצא: " + path);
         long max = Math.Clamp(b.Long("maxBytes", 5L * 1024 * 1024), 1, 50L * 1024 * 1024);
+        // offset: קריאה בחלקים של קובץ גדול מ-50MB. binary: תמיד base64 (גם בסיומת טקסט), כדי שחיתוך באמצע תו לא ישבש.
+        long offset = Math.Max(0, b.Long("offset", 0));
+        bool binary = b.Bool("binary");
         var fi = new FileInfo(path);
         string ext = fi.Extension;
-        bool truncated = fi.Length > max;
-        int len = (int)Math.Min(fi.Length, max);
+        long remaining = Math.Max(0, fi.Length - offset);
+        bool truncated = remaining > max;
+        int len = (int)Math.Min(remaining, max);
 
         byte[] buf = new byte[len];
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
         {
+            if (offset > 0) fs.Seek(Math.Min(offset, fs.Length), SeekOrigin.Begin);
             int read = 0;
             while (read < len)
             {
@@ -430,12 +519,12 @@ public static class FsApi
         }
 
         string mime = Mime.TryGetValue(ext, out var m) ? m : "application/octet-stream";
-        if (TextExt.Contains(ext))
+        if (!binary && offset == 0 && TextExt.Contains(ext))
         {
             string content = DecodeText(buf);
-            return new { name = fi.Name, size = fi.Length, mime, encoding = "utf8", content, truncated };
+            return new { name = fi.Name, size = fi.Length, mime, encoding = "utf8", content, truncated, offset };
         }
-        return new { name = fi.Name, size = fi.Length, mime, encoding = "base64", content = Convert.ToBase64String(buf), truncated };
+        return new { name = fi.Name, size = fi.Length, mime, encoding = "base64", content = Convert.ToBase64String(buf), truncated, offset };
     }
 
     private static string DecodeText(byte[] buf)
@@ -562,6 +651,16 @@ public static class FsApi
     {
         string path = FullPath(b.Req("path"));
         if (!Exists(path)) throw BridgeException.NotFound("לא נמצא: " + path);
+        if (FxPolicy.IsRestricted)
+        {
+            // פתיחת תיקייה או קיצור דרך מפעילה את סייר Windows עצמו, שאינו כפוף למדיניות
+            string e = Path.GetExtension(path).ToLowerInvariant();
+            if (Directory.Exists(path) || e is ".lnk" or ".url" or ".scf" or ".appref-ms")
+                throw FxPolicy.Outside("במצב מוגבל אי אפשר לפתוח תיקיות וקיצורי דרך בסייר Windows");
+        }
+        // משוב 15.10: קובץ הפעלה — רק התוכנה שלנו או תוכנה מהרשימה (תורניות/מותרות), בלי חלון "כיצד לפתוח" של Windows
+        if (File.Exists(path) && Path.GetExtension(path).Equals(".exe", StringComparison.OrdinalIgnoreCase))
+            return OpenExe(path);
         if (Kiosk.IsActive)
         {
             string ext = Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
@@ -569,16 +668,51 @@ public static class FsApi
                 x.TrimStart('.').Equals(ext, StringComparison.OrdinalIgnoreCase));
             if (!allowed) throw BridgeException.Locked();
         }
+        // #59: "לשאול כל פעם באיזו תוכנה לפתוח" — חלון "פתח באמצעות" של Windows. לא בנעילה/מצב מוגבל:
+        // החלון מאפשר לדפדף לכל תוכנה במחשב, ולכן שם נשארת הפתיחה בתוכנת ברירת המחדל בלבד.
+        if (b.Has("openWith") && b.Bool("openWith") && File.Exists(path) && !Kiosk.IsActive && !FxPolicy.IsRestricted)
+        {
+            Process.Start(new ProcessStartInfo("rundll32.exe", "shell32.dll,OpenAs_RunDLL " + path) { UseShellExecute = false });
+            return new { opened = true, chooser = true };
+        }
         Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
         return new { opened = true };
+    }
+
+    private static object OpenExe(string path)
+    {
+        string full = Path.GetFullPath(path);
+        string name = Path.GetFileNameWithoutExtension(full);
+        // הגשר עצמו — פותחים את החלון הראשי במקום להריץ עותק נוסף
+        if (string.Equals(full, Environment.ProcessPath, StringComparison.OrdinalIgnoreCase)
+            || name.Equals("OtzariaBridge", StringComparison.OrdinalIgnoreCase))
+        {
+            Tray.Invoke(Hub.ShowMain);
+            return new { opened = true, app = "self" };
+        }
+        // תוכנה מרשימת התוכנות התורניות/המותרות — אותה הפעלה כמו מסרגל התוכנות (בלי כפילות אם כבר פתוחה)
+        var hit = Programs.Load().FirstOrDefault(e => string.Equals(Path.GetFullPath(e.Path), full, StringComparison.OrdinalIgnoreCase));
+        if (hit != null) { Programs.Activate(hit); return new { opened = true, app = hit.Name }; }
+        // קובץ ההתקנה/העדכון שלנו (לא בזמן נעילה)
+        bool ours = name.Contains("achat", StringComparison.OrdinalIgnoreCase) || name.Contains("אחת שאלתי") || name.Contains("OtzariaBridge", StringComparison.OrdinalIgnoreCase);
+        if (ours && !Kiosk.IsActive)
+        {
+            Process.Start(new ProcessStartInfo(full) { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(full) });
+            return new { opened = true, app = "setup" };
+        }
+        throw BridgeException.Forbidden("אפשר להפעיל מהסייר רק את אחת שאלתי ואת התוכנות שברשימת התוכנות התורניות. להוספת תוכנה: הגדרות מערכת ← נעילה ← תוכנות");
     }
 
     private static object Reveal(JsonElement b)
     {
         if (Kiosk.IsActive) throw BridgeException.Locked();
         string path = FullPath(b.Req("path"));
+        if (FxPolicy.IsRestricted) throw FxPolicy.Outside("במצב מוגבל אי אפשר להציג בסייר Windows");
         if (!Exists(path)) throw BridgeException.NotFound("לא נמצא: " + path);
         string args = File.Exists(path) ? "/select,\"" + path + "\"" : "\"" + path + "\"";
+        // בלי זה: השומר (Kiosk.Watch, רץ כל 2 שניות) לא מכיר explorer.exe שנפתח כך כ"מותר", ומחזיר
+        // את אוצריא לחזית כמעט מיד - נראה כאילו הסייר "נפתח ברקע" בעוד שבפועל הוא נפתח וממש נסגר-לחזית
+        Programs.GrantForegroundGrace();
         Process.Start(new ProcessStartInfo("explorer.exe", args) { UseShellExecute = true });
         return new { ok = true };
     }
@@ -587,7 +721,8 @@ public static class FsApi
 
     private static object ClipboardGet() => Sta.Run(() =>
     {
-        var list = Clipboard.ContainsFileDropList() ? Clipboard.GetFileDropList().Cast<string>().ToArray() : Array.Empty<string>();
+        FxPolicy.EnsureAvailable();
+        var list = Clipboard.ContainsFileDropList() ? Clipboard.GetFileDropList().Cast<string>().Where(FxPolicy.IsPathAllowed).ToArray() : Array.Empty<string>();
         bool cut = false;
         if (Clipboard.GetData("Preferred DropEffect") is MemoryStream ms && ms.Length >= 4)
         {
